@@ -1,0 +1,56 @@
+services:
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrate
+    command: ["postgres://${DB_USERNAME}:${DB_PASSWORD}@psql_bp:5432/${DB_DATABASE}?sslmode=disable&search_path=${DB_SCHEMA}", "up"]
+    depends_on:
+      psql_bp:
+        condition: service_healthy
+    networks:
+      - blueprint
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    restart: unless-stopped
+    ports:
+      - ${PORT}:${PORT}
+    env_file: .env
+    environment:
+      DB_HOST: psql_bp
+      DB_PORT: 5432
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      psql_bp:
+        condition: service_healthy
+    networks:
+      - blueprint
+  psql_bp:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "${DB_PORT}:5432"
+    volumes:
+      - psql_volume_bp:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "sh -c 'pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}'"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - blueprint
+
+volumes:
+  psql_volume_bp:
+networks:
+  blueprint:
