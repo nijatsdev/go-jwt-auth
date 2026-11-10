@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -14,6 +15,7 @@ type Scheduler struct {
 	logger               *logger.Logger
 	refreshTokenStore    store.RefreshTokenStore
 	scheduler            gocron.Scheduler
+	cleanupJob           gocron.Job
 	expiredRetentionDays int
 	revokedRetentionDays int
 }
@@ -54,6 +56,7 @@ func (s *Scheduler) Start() error {
 	if err != nil {
 		return err
 	}
+	s.cleanupJob = cleanupJob
 
 	// Start the scheduler
 	s.scheduler.Start()
@@ -103,27 +106,24 @@ func (s *Scheduler) runCleanup() {
 
 	startTime := time.Now()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
 	tokensDeleted, err := s.refreshTokenStore.CleanupExpired(
+		ctx,
 		s.expiredRetentionDays,
 		s.revokedRetentionDays,
 	)
 	if err != nil {
+		s.logger.Error().Err(err).Msg("Token cleanup failed")
 		return
 	}
 
 	duration := time.Since(startTime).Seconds()
 
-	jobs := s.scheduler.Jobs()
-	if len(jobs) == 0 {
-		s.logger.Error().Msg("No jobs found in scheduler")
-		return
-	}
-
-	nextRun, err := jobs[0].NextRun()
+	nextRun, err := s.cleanupJob.NextRun()
 	if err != nil {
-		s.logger.Error().
-			Err(err).
-			Msg("Failed to get next run time")
+		s.logger.Error().Err(err).Msg("Failed to get next run time for cleanup job")
 		return
 	}
 

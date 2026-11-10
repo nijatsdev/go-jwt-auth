@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/nijatsdev/go-jwt-auth/internal/database"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -62,8 +64,10 @@ type UserStore interface {
 	CheckExistsByEmail(ctx context.Context, email string) (bool, error)
 }
 
-// ErrUserNotFound is returned when a user is not found in the store.
-var ErrUserNotFound = errors.New("user not found")
+// NormalizeEmail lowercases and trims an email address for storage and lookup.
+func NormalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
 
 type PostgresUserStore struct {
 	db *sql.DB
@@ -102,8 +106,10 @@ func (s *PostgresUserStore) GetByID(ctx context.Context, id uuid.UUID) (*User, e
 		&user.UpdatedAt,
 	)
 	if err != nil {
-		log.Ctx(ctx).Err(err).
-			Msg("Database error getting user by ID")
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, sql.ErrNoRows
+		}
+		log.Ctx(ctx).Err(err).Msg("Database error getting user by ID")
 		return nil, err
 	}
 	return user, nil
@@ -119,10 +125,11 @@ func (s *PostgresUserStore) Create(ctx context.Context, user *User) error {
 	err := exec.QueryRowContext(ctx, query, user.Name, user.Email, user.PasswordHash.hash).
 		Scan(&user.ID, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
-		log.Ctx(ctx).Error().
-			Err(err).
-			Str("email", user.Email).
-			Msg("Database error creating user")
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return errors.New("duplicate email")
+		}
+		log.Ctx(ctx).Error().Err(err).Str("email", user.Email).Msg("Database error creating user")
 		return err
 	}
 	return nil
@@ -135,7 +142,7 @@ func (s *PostgresUserStore) GetByEmail(ctx context.Context, email string) (*User
 	user := &User{}
 	query := `SELECT id, name, email, password_hash, created_at, updated_at
 	FROM users
-	WHERE email = $1`
+	WHERE LOWER(email) = LOWER($1)`
 	err := exec.QueryRowContext(ctx, query, email).Scan(
 		&user.ID,
 		&user.Name,
@@ -161,7 +168,7 @@ func (s *PostgresUserStore) CheckExistsByEmail(ctx context.Context, email string
 	exec := s.getQueryable(ctx)
 
 	var exists bool
-	query := `SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)`
+	query := `SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(email) = LOWER($1))`
 	err := exec.QueryRowContext(ctx, query, email).Scan(&exists)
 	if err != nil {
 		log.Ctx(ctx).Error().

@@ -12,21 +12,25 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
+
 )
 
 func (s *Server) registerRoutes() http.Handler {
 	r := chi.NewRouter()
 
-	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://*", "http://*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-		AllowCredentials: true,
-		MaxAge:           300,
-	}))
+	origins := s.config.CORSOrigins()
+	if len(origins) > 0 {
+		r.Use(cors.Handler(cors.Options{
+			AllowedOrigins:   origins,
+			AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"},
+			AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+			AllowCredentials: true,
+			MaxAge:           300,
+		}))
+	}
 
-	r.Use(chimiddleware.RealIP)
+	r.Use(middleware.TrustedRealIP(s.trustedProxies))
+	r.Use(middleware.LimitRequestBody(1 << 20))
 
 	r.Use(hlog.NewHandler(s.logger.Logger))
 	r.Use(hlog.MethodHandler("method"))
@@ -61,28 +65,28 @@ func (s *Server) registerRoutes() http.Handler {
 
 	r.Route("/auth", func(r chi.Router) {
 		r.Group(func(r chi.Router) {
-			r.Use(s.rateLimiter.Limit(5, time.Minute))
+			r.Use(s.rateLimiter.Limit("auth:login_register", 5, time.Minute))
 			r.Post("/login", s.authHandler.HandleLogin)
 			r.Post("/register", s.authHandler.HandleRegister)
 		})
 
 		r.Group(func(r chi.Router) {
-			r.Use(s.rateLimiter.Limit(10, time.Minute))
+			r.Use(s.rateLimiter.Limit("auth:refresh", 10, time.Minute))
 			r.Post("/refresh", s.authHandler.HandleRefresh)
 		})
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.authMiddleware.Authenticate)
-			r.Use(s.rateLimiter.Limit(60, time.Minute))
+			r.Use(s.rateLimiter.Limit("auth:session", 60, time.Minute))
 			r.Post("/logout", s.authHandler.HandleLogout)
 			r.Get("/sessions", s.authHandler.HandleListSessions)
-			r.Put("/sessions/{session_id}", s.authHandler.HandleRevokeSession)
+			r.Delete("/sessions/{session_id}", s.authHandler.HandleRevokeSession)
 		})
 	})
 
 	r.Route("/profile", func(r chi.Router) {
 		r.Use(s.authMiddleware.Authenticate)
-		r.Use(s.rateLimiter.Limit(100, time.Minute))
+		r.Use(s.rateLimiter.Limit("profile", 100, time.Minute))
 		r.Get("/", s.userHandler.HandleGetProfile)
 	})
 
@@ -102,5 +106,11 @@ func (s *Server) welcomeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
-	response.WriteJSON(w, r, http.StatusOK, s.db.Health())
+	health := s.db.Health()
+	status := http.StatusOK
+	switch health["status"] {
+	case "down", "degraded":
+		status = http.StatusServiceUnavailable
+	}
+	response.WriteJSON(w, r, status, health)
 }

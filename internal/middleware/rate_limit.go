@@ -1,17 +1,25 @@
 package middleware
 
 import (
+	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/nijatsdev/go-jwt-auth/internal/response"
+	"github.com/nijatsdev/go-jwt-auth/internal/utils"
 )
 
-// RateLimiter holds dependencies for rate limiting logic
+const (
+	defaultMaxClientEntries = 10_000
+)
+
+// RateLimiter holds per-endpoint rate limiting state.
 type RateLimiter struct {
 	mu      sync.Mutex
 	clients map[string]*clientInfo
+	stopCh  chan struct{}
+	maxKeys int
 }
 
 type clientInfo struct {
@@ -19,67 +27,110 @@ type clientInfo struct {
 	resetTime time.Time
 }
 
-// NewRateLimiter creates new RateLimiter middleware
+// NewRateLimiter creates new RateLimiter middleware.
 func NewRateLimiter() *RateLimiter {
 	rl := &RateLimiter{
 		clients: make(map[string]*clientInfo),
+		stopCh:  make(chan struct{}),
+		maxKeys: defaultMaxClientEntries,
 	}
 
-	// Cleanup expired entries every minute
 	go rl.cleanup()
-
 	return rl
 }
 
-// cleanup periodically removes expired client entries
+// Stop ends the background cleanup goroutine.
+func (rl *RateLimiter) Stop() {
+	select {
+	case <-rl.stopCh:
+	default:
+		close(rl.stopCh)
+	}
+}
+
 func (rl *RateLimiter) cleanup() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		for ip, info := range rl.clients {
-			if now.After(info.resetTime) {
-				delete(rl.clients, ip)
+	for {
+		select {
+		case <-rl.stopCh:
+			return
+		case <-ticker.C:
+			rl.mu.Lock()
+			now := time.Now()
+			for key, info := range rl.clients {
+				if now.After(info.resetTime) {
+					delete(rl.clients, key)
+				}
 			}
+			rl.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
 }
 
-// Limit creates a middleware that limits requests by IP address
-// blocks requests if they exceed 'limit' within 'window' duration
-func (rl *RateLimiter) Limit(limit int, window time.Duration) func(http.Handler) http.Handler {
+func clientIPKey(remoteAddr string) string {
+	host, port, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return utils.HostFromAddr(remoteAddr)
+	}
+	if port != "" {
+		// Direct connection: key on IP only (ephemeral port must not create new buckets).
+		return host
+	}
+	return remoteAddr
+}
+
+// Limit creates middleware that limits requests per client IP for a named endpoint bucket.
+func (rl *RateLimiter) Limit(endpoint string, limit int, window time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := r.RemoteAddr // Note: specific implementation depends on proxy setup (X-Forwarded-For etc.)
+			key := endpoint + "|" + clientIPKey(r.RemoteAddr)
 
 			rl.mu.Lock()
-			defer rl.mu.Unlock()
+			allowed := rl.recordAndAllow(key, limit, window)
+			rl.mu.Unlock()
 
-			now := time.Now()
-			client, exists := rl.clients[ip]
-
-			if !exists || now.After(client.resetTime) {
-				// New client or window expired
-				rl.clients[ip] = &clientInfo{
-					count:     1,
-					resetTime: now.Add(window),
-				}
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			if client.count >= limit {
-				// Rate limit exceeded
+			if !allowed {
 				response.WriteTooManyRequestsError(w, r, "Rate limit exceeded. Please try again later.")
 				return
 			}
 
-			// Increment count
-			client.count++
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func (rl *RateLimiter) recordAndAllow(key string, limit int, window time.Duration) bool {
+	now := time.Now()
+	client, exists := rl.clients[key]
+
+	if !exists || now.After(client.resetTime) {
+		if len(rl.clients) >= rl.maxKeys && !exists {
+			// Evict one expired entry or reject (fail closed under memory pressure).
+			evicted := false
+			for k, info := range rl.clients {
+				if now.After(info.resetTime) {
+					delete(rl.clients, k)
+					evicted = true
+					break
+				}
+			}
+			if !evicted && len(rl.clients) >= rl.maxKeys {
+				return false
+			}
+		}
+		rl.clients[key] = &clientInfo{
+			count:     1,
+			resetTime: now.Add(window),
+		}
+		return true
+	}
+
+	if client.count >= limit {
+		return false
+	}
+
+	client.count++
+	return true
 }

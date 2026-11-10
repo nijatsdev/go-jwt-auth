@@ -21,9 +21,18 @@ type Config struct {
 	DBUsername string `env:"DB_USERNAME" env-required:"true"`
 	DBPassword string `env:"DB_PASSWORD"`
 	DBSchema   string `env:"DB_SCHEMA" env-default:"public"`
+	DBSSLMode  string `env:"DB_SSLMODE" env-default:"disable"`
 
 	// JWT config
-	JWTSecret string `env:"JWT_SECRET" env-required:"true"`
+	JWTSecret  string `env:"JWT_SECRET" env-required:"true"`
+	JWTIssuer  string `env:"JWT_ISSUER" env-default:"go-jwt-auth"`
+	JWTAudience string `env:"JWT_AUDIENCE" env-default:"go-jwt-auth-api"`
+
+	// CORS (comma-separated origins; empty disables credentialed wide-open CORS)
+	CORSAllowedOrigins string `env:"CORS_ALLOWED_ORIGINS"`
+
+	// TrustedProxyCIDRs — comma-separated CIDRs; X-Forwarded-For is honored only from these peers.
+	TrustedProxyCIDRs string `env:"TRUSTED_PROXY_CIDRS"`
 
 	// Token config
 	AccessTokenTTL                time.Duration `env:"ACCESS_TOKEN_TTL" env-default:"15m"`
@@ -62,7 +71,42 @@ func Load(configPath string) (*Config, error) {
 	cfg.IsLocal = cfg.AppEnv == "local" || cfg.AppEnv == "development" || cfg.AppEnv == "dev"
 	cfg.IsProduction = cfg.AppEnv == "production" || cfg.AppEnv == "prod"
 
+	if cfg.CORSAllowedOrigins == "" && cfg.IsLocal {
+		cfg.CORSAllowedOrigins = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
+	}
+
+	if cfg.TrustedProxyCIDRs == "" && cfg.IsLocal {
+		cfg.TrustedProxyCIDRs = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128"
+	}
+
 	return cfg, nil
+}
+
+// CORSOrigins returns parsed CORS allowed origins.
+func (c *Config) CORSOrigins() []string {
+	if c.CORSAllowedOrigins == "" {
+		return nil
+	}
+	parts := make([]string, 0)
+	start := 0
+	for i := 0; i <= len(c.CORSAllowedOrigins); i++ {
+		if i == len(c.CORSAllowedOrigins) || c.CORSAllowedOrigins[i] == ',' {
+			if i > start {
+				origin := c.CORSAllowedOrigins[start:i]
+				for len(origin) > 0 && (origin[0] == ' ' || origin[0] == '\t') {
+					origin = origin[1:]
+				}
+				for len(origin) > 0 && (origin[len(origin)-1] == ' ' || origin[len(origin)-1] == '\t') {
+					origin = origin[:len(origin)-1]
+				}
+				if origin != "" {
+					parts = append(parts, origin)
+				}
+			}
+			start = i + 1
+		}
+	}
+	return parts
 }
 
 // Additional semantic validation

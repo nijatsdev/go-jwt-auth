@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -20,6 +22,7 @@ type Server struct {
 	httpServer     *http.Server
 	logger         *logger.Logger
 	config         *config.Config
+	trustedProxies []*net.IPNet
 	db             database.Service
 	authMiddleware *middleware.AuthMiddleware
 	rateLimiter    *middleware.RateLimiter
@@ -49,6 +52,7 @@ func NewServer() (*Server, error) {
 		Username: cfg.DBUsername,
 		Password: cfg.DBPassword,
 		Schema:   cfg.DBSchema,
+		SSLMode:  cfg.DBSSLMode,
 	}, appLogger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create database service: %w", err)
@@ -70,6 +74,8 @@ func NewServer() (*Server, error) {
 		cfg.AccessTokenTTL,
 		cfg.RefreshTokenTTL,
 		cfg.JWTSecret,
+		cfg.JWTIssuer,
+		cfg.JWTAudience,
 		cfg.MaxActiveRefreshTokensPerUser,
 	)
 
@@ -97,8 +103,14 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("failed to start scheduler: %w", err)
 	}
 
+	trustedProxies, err := middleware.ParseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("invalid TRUSTED_PROXY_CIDRS: %w", err)
+	}
+
 	// Create a server instance
 	newServer := &Server{
+		trustedProxies: trustedProxies,
 		logger:         appLogger,
 		config:         cfg,
 		db:             dbService,
@@ -134,20 +146,24 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully shuts down the server and its components
 func (s *Server) Shutdown(ctx context.Context) error {
+	var errs []error
+
 	if err := s.scheduler.Shutdown(); err != nil {
-		return err
+		errs = append(errs, err)
 	}
+
+	s.rateLimiter.Stop()
 
 	s.logger.Info().Msg("Stopping HTTP server")
 	if err := s.httpServer.Shutdown(ctx); err != nil {
-		return err
+		errs = append(errs, err)
 	}
 
 	if err := s.db.Close(); err != nil {
-		return err
+		errs = append(errs, err)
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // GetLogger returns the server's logger

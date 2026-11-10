@@ -46,7 +46,6 @@ func (am *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 			case len(parts) == 2 && strings.EqualFold(parts[0], "Bearer"):
 				tokenString = parts[1]
 			default:
-				// a non-standard token format was used
 				response.WriteUnauthorizedError(w, r, "Invalid authorization header")
 				return
 			}
@@ -74,14 +73,32 @@ func (am *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, ClaimsKey, claims)
 
 		// get user ID from ctx
-		userID := GetUserID(ctx)
+		userID, ok := GetUserID(ctx)
+		if !ok {
+			response.WriteUnauthorizedError(w, r, "Invalid access token")
+			return
+		}
+
+		sessionID, ok := GetSessionID(ctx)
+		if !ok {
+			response.WriteUnauthorizedError(w, r, "Invalid access token")
+			return
+		}
+
+		if err := am.authService.EnsureAccessSessionActive(ctx, userID, sessionID); err != nil {
+			if errors.Is(err, services.ErrSessionInactive) {
+				response.WriteUnauthorizedError(w, r, "Access token has expired")
+				return
+			}
+			response.WriteInternalServerError(w, r, "")
+			return
+		}
 
 		// Add user ID to logger context
 		zerolog.Ctx(ctx).UpdateContext(func(c zerolog.Context) zerolog.Context {
 			return c.Str("user_id", userID.String())
 		})
 
-		// call next handler with the enriched context
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 
@@ -89,14 +106,41 @@ func (am *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 }
 
 // GetUserID retrieves the user ID from the claims in the request context
-func GetUserID(ctx context.Context) uuid.UUID {
-	claims := GetClaims(ctx)
-	userIDStr := claims["sub"].(string)
-	userID, _ := uuid.Parse(userIDStr)
-	return userID
+func GetUserID(ctx context.Context) (uuid.UUID, bool) {
+	claims, ok := GetClaims(ctx)
+	if !ok {
+		return uuid.Nil, false
+	}
+	userIDStr, ok := claims["sub"].(string)
+	if !ok {
+		return uuid.Nil, false
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return userID, true
+}
+
+// GetSessionID returns the refresh session id (sid) claim when present.
+func GetSessionID(ctx context.Context) (uuid.UUID, bool) {
+	claims, ok := GetClaims(ctx)
+	if !ok {
+		return uuid.Nil, false
+	}
+	sid, ok := claims["sid"].(string)
+	if !ok {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(sid)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return id, true
 }
 
 // GetClaims retrieves the claims from the request context
-func GetClaims(ctx context.Context) jwt.MapClaims {
-	return ctx.Value(ClaimsKey).(jwt.MapClaims)
+func GetClaims(ctx context.Context) (jwt.MapClaims, bool) {
+	claims, ok := ctx.Value(ClaimsKey).(jwt.MapClaims)
+	return claims, ok
 }

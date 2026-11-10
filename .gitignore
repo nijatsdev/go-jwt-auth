@@ -34,3 +34,7 @@ main
 
 # Binaries
 bin
+
+.omp/
+omp-session-*.html
+status-cache.json

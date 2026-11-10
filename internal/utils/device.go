@@ -4,39 +4,42 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"net"
+	"sync"
 
 	"github.com/medama-io/go-useragent"
 )
 
-// GenerateDeviceFingerprint creates a unique device identifier from request headers
-func GenerateDeviceFingerprint(userAgent, ipAddress, acceptLanguage, acceptEncoding string) (string, error) {
-	host, _, err := net.SplitHostPort(ipAddress)
-	if err != nil {
-		return "", err
-	}
-	data := fmt.Sprintf("%s|%s|%s|%s",
-		userAgent,
-		host,
-		acceptLanguage,
-		acceptEncoding,
-	)
+var (
+	deviceParser     *useragent.Parser
+	deviceParserOnce sync.Once
+)
+
+func deviceUAParser() *useragent.Parser {
+	deviceParserOnce.Do(func() {
+		deviceParser = useragent.NewParser()
+	})
+	return deviceParser
+}
+
+// GenerateDeviceFingerprint creates a stable device identifier from client-controlled headers.
+// IP is intentionally excluded (spoofable behind proxies, brittle on mobile networks).
+func GenerateDeviceFingerprint(userAgent, acceptLanguage, acceptEncoding string) string {
+	data := fmt.Sprintf("%s|%s|%s", userAgent, acceptLanguage, acceptEncoding)
 	hash := sha256.Sum256([]byte(data))
-	return base64.URLEncoding.EncodeToString(hash[:16]), nil
+	return base64.URLEncoding.EncodeToString(hash[:16])
 }
 
 // ParseDeviceName extracts readable device information from the user agent
 func ParseDeviceName(userAgentString string) string {
-	parser := useragent.NewParser()
-	ua := parser.Parse(userAgentString)
+	ua := deviceUAParser().Parse(userAgentString)
 
 	deviceType := "Unknown"
 	if ua.IsDesktop() {
 		deviceType = "Desktop"
-	} else if ua.IsMobile() {
-		deviceType = "Mobile"
 	} else if ua.IsTablet() {
 		deviceType = "Tablet"
+	} else if ua.IsMobile() {
+		deviceType = "Mobile"
 	} else if ua.IsBot() {
 		deviceType = "Bot"
 	}
