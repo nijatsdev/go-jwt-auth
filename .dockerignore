@@ -1,8 +1,5 @@
 .git
 .env
-.omp
-omp-session-*.html
-status-cache.json
 main
 *.md
 .github

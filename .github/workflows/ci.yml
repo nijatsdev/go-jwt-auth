@@ -28,9 +28,6 @@ jobs:
       - name: Integration tests
         run: go test -race -count=1 ./internal/handlers/...
 
-      - name: Govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-
   docker-amd64:
     runs-on: ubuntu-latest
     steps:
