@@ -4,19 +4,32 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"crypto/sha256"
 	"fmt"
-	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/nijatsdev/go-jwt-auth/internal/database"
 	"github.com/nijatsdev/go-jwt-auth/internal/store"
 	"github.com/nijatsdev/go-jwt-auth/internal/utils"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/crypto/bcrypt"
 )
+
+// Bcrypt hash used to normalize login timing when the email is unknown.
+var loginTimingDummyHash = func() []byte {
+	sum := sha256.Sum256([]byte("login-timing-dummy"))
+	h, err := bcrypt.GenerateFromPassword(sum[:], bcrypt.DefaultCost)
+	if err != nil {
+		panic("login timing dummy hash: " + err.Error())
+	}
+	return h
+}()
 
 // AuthService handles authentication operations including login, logout,
 // registration, token refresh, and session management.
@@ -28,6 +41,8 @@ type AuthService struct {
 	accessTokenTTL                time.Duration
 	refreshTokenTTL               time.Duration
 	jwtSecret                     []byte
+	jwtIssuer                     string
+	jwtAudience                   string
 	maxActiveRefreshTokensPerUser int
 	gracePeriod                   time.Duration
 	maxGracePeriodReuses          int
@@ -40,7 +55,7 @@ func NewAuthService(
 	refreshTokenStore store.RefreshTokenStore,
 	accessTokenTTL,
 	refreshTokenTTL time.Duration,
-	jwtSecret string,
+	jwtSecret, jwtIssuer, jwtAudience string,
 	maxActiveRefreshTokensPerUser int) *AuthService {
 	return &AuthService{
 		userStore:                     userStore,
@@ -50,6 +65,8 @@ func NewAuthService(
 		accessTokenTTL:                accessTokenTTL,
 		refreshTokenTTL:               refreshTokenTTL,
 		jwtSecret:                     []byte(jwtSecret),
+		jwtIssuer:                     jwtIssuer,
+		jwtAudience:                   jwtAudience,
 		maxActiveRefreshTokensPerUser: maxActiveRefreshTokensPerUser,
 		gracePeriod:                   3 * time.Second, // Grace period for concurrent refresh requests
 		maxGracePeriodReuses:          3,               // Max reuses during grace period (1 normal + 2 retry)
@@ -63,8 +80,9 @@ var (
 	ErrRefreshTokenNotFound = errors.New("refresh token not found")
 	ErrRefreshTokenRevoked  = errors.New("refresh token has been revoked")
 	ErrRefreshTokenExpired  = errors.New("refresh token has expired")
-	ErrSessionNotFound      = errors.New("session not found")
-	ErrUnauthorizedSession  = errors.New("unauthorized to revoke this session")
+	ErrSessionNotFound = errors.New("session not found")
+	ErrSessionInactive = errors.New("session inactive")
+	ErrUserDeleted     = errors.New("user not found")
 )
 
 // LoginResult contains the result of a successful login.
@@ -89,12 +107,15 @@ func (s *AuthService) Login(r *http.Request, email, password string) (*LoginResu
 	acceptLanguage := r.Header.Get("Accept-Language")
 	acceptEncoding := r.Header.Get("Accept-Encoding")
 
+	email = store.NormalizeEmail(email)
 	log.Ctx(ctx).Info().Str("email", email).Msg("Login attempt")
 
 	// Get user by email
 	user, err := s.userStore.GetByEmail(ctx, email)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			sum := sha256.Sum256([]byte(password))
+			_ = bcrypt.CompareHashAndPassword(loginTimingDummyHash, sum[:])
 			log.Ctx(ctx).Warn().Str("email", email).Msg("Login failed: user not found")
 			return nil, ErrInvalidCredentials
 		}
@@ -111,11 +132,7 @@ func (s *AuthService) Login(r *http.Request, email, password string) (*LoginResu
 		return nil, ErrInvalidCredentials
 	}
 
-	// Generate device fingerprint
-	deviceID, err := utils.GenerateDeviceFingerprint(userAgent, ipAddress, acceptLanguage, acceptEncoding)
-	if err != nil {
-		return nil, err
-	}
+	deviceID := utils.GenerateDeviceFingerprint(userAgent, acceptLanguage, acceptEncoding)
 	deviceName := utils.ParseDeviceName(userAgent)
 
 	var result *LoginResult
@@ -178,14 +195,28 @@ func (s *AuthService) Login(r *http.Request, email, password string) (*LoginResu
 	return result, nil
 }
 
-// Logout revokes the current refresh token session.
+// Logout revokes the active refresh token in the session family (handles stale access tokens).
 func (s *AuthService) Logout(ctx context.Context, refreshTokenID uuid.UUID) error {
-	if err := s.revokeToken(ctx, refreshTokenID, store.RevokedReasonUserLogout); err != nil {
+	active, err := s.refreshTokenStore.GetActiveForwardLeaf(ctx, refreshTokenID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+
+	if err := s.revokeToken(ctx, active.ID, store.RevokedReasonUserLogout); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return fmt.Errorf("revoking token: %w", err)
+	}
+	if _, err := s.revokeRotationChain(ctx, active.ID, store.RevokedReasonUserLogout); err != nil {
+		return err
 	}
 
 	log.Ctx(ctx).Info().
-		Str("token_id", refreshTokenID.String()).
+		Str("token_id", active.ID.String()).
 		Msg("Logout successful")
 
 	return nil
@@ -193,6 +224,7 @@ func (s *AuthService) Logout(ctx context.Context, refreshTokenID uuid.UUID) erro
 
 // Register creates a new user account
 func (s *AuthService) Register(ctx context.Context, name, email, password string) (*store.User, error) {
+	email = store.NormalizeEmail(email)
 	log.Ctx(ctx).Info().Str("email", email).Msg("Registration attempt")
 
 	// Check if email already exists
@@ -220,6 +252,9 @@ func (s *AuthService) Register(ctx context.Context, name, email, password string
 
 	// Save user to a database
 	if err := s.userStore.Create(ctx, user); err != nil {
+		if strings.Contains(err.Error(), "duplicate email") {
+			return nil, ErrEmailExists
+		}
 		return nil, err
 	}
 
@@ -243,15 +278,11 @@ func (s *AuthService) Refresh(r *http.Request, refreshToken string) (*RefreshRes
 
 	hashedToken := utils.HashToken(refreshToken)
 
-	// Generate device fingerprint upfront
-	currentDeviceID, err := utils.GenerateDeviceFingerprint(userAgent, ipAddress, acceptLanguage, acceptEncoding)
-	if err != nil {
-		return nil, err
-	}
+	currentDeviceID := utils.GenerateDeviceFingerprint(userAgent, acceptLanguage, acceptEncoding)
 
 	var result *RefreshResult
 
-	err = s.txManager.WithTransaction(ctx, func(txCtx context.Context) error {
+	err := s.txManager.WithTransaction(ctx, func(txCtx context.Context) error {
 		// Fetch and lock the refresh token
 		token, err := s.refreshTokenStore.GetByTokenHashForUpdate(txCtx, hashedToken)
 		if err != nil {
@@ -304,7 +335,7 @@ func (s *AuthService) Refresh(r *http.Request, refreshToken string) (*RefreshRes
 			if err != nil {
 				return err
 			}
-			if childCount == s.maxGracePeriodReuses {
+			if childCount >= s.maxGracePeriodReuses {
 				// Grace period abuse detected - too many reuses
 				if err := s.revokeToken(txCtx, token.ID, store.RevokedReasonGracePeriodAbuse); err != nil {
 					return err
@@ -317,6 +348,12 @@ func (s *AuthService) Refresh(r *http.Request, refreshToken string) (*RefreshRes
 					Msg("Grace period abuse: too many reuses, revoked token chain")
 				// CommitError: persist revocations but return error to user
 				return database.NewCommitError(ErrRefreshTokenRevoked)
+			}
+			if _, childErr := s.refreshTokenStore.GetActiveChildByParent(txCtx, token.ID); childErr == nil {
+				log.Ctx(txCtx).Warn().Str("token_id", token.ID.String()).Msg("Grace reuse rejected: active child already exists")
+				return ErrRefreshTokenRevoked
+			} else if childErr != nil && !errors.Is(childErr, sql.ErrNoRows) {
+				return childErr
 			}
 			log.Ctx(txCtx).Debug().Str("token_id", token.ID.String()).Msg("Token reused within grace period")
 			isGracefulReuse = true
@@ -355,7 +392,7 @@ func (s *AuthService) Refresh(r *http.Request, refreshToken string) (*RefreshRes
 		user, err := s.userStore.GetByID(txCtx, token.UserID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return errors.New("user not found")
+				return ErrUserDeleted
 			}
 			return err
 		}
@@ -406,18 +443,7 @@ func (s *AuthService) ListSessions(ctx context.Context, userID uuid.UUID, refres
 		return nil, err
 	}
 
-	// Deduplicate sessions by DeviceID
-	uniqueSessions := make([]*store.RefreshTokenResponse, 0)
-	seenDevices := make(map[string]bool)
-
-	for _, session := range sessions {
-		if !seenDevices[session.DeviceID] {
-			uniqueSessions = append(uniqueSessions, session)
-			seenDevices[session.DeviceID] = true
-		}
-	}
-
-	return uniqueSessions, nil
+	return sessions, nil
 }
 
 // RevokeSession revokes a specific refresh token session for a user
@@ -437,9 +463,9 @@ func (s *AuthService) RevokeSession(ctx context.Context, userID uuid.UUID, sessi
 		return err
 	}
 
-	// Check if token belongs to the user
+	// Check if token belongs to the user (same response as not found)
 	if token.UserID != userID {
-		return ErrUnauthorizedSession
+		return ErrSessionNotFound
 	}
 
 	// Check if already revoked
@@ -447,8 +473,11 @@ func (s *AuthService) RevokeSession(ctx context.Context, userID uuid.UUID, sessi
 		return ErrSessionNotFound
 	}
 
-	// Revoke the token (remote revoke — user is ending another device's session)
+	// Revoke the token and any forward rotation chain
 	if err := s.revokeToken(ctx, sessionUUID, store.RevokedReasonRemoteRevoke); err != nil {
+		return err
+	}
+	if _, err := s.revokeRotationChain(ctx, sessionUUID, store.RevokedReasonRemoteRevoke); err != nil {
 		return err
 	}
 
@@ -467,7 +496,10 @@ func (s *AuthService) generateTokens(ctx context.Context, user *store.User, user
 		return "", "", time.Time{}, err
 	}
 
-	accessToken, expirationTime, err = utils.GenerateAccessToken(user.ID, user.Name, user.Email, refreshTokenId, s.accessTokenTTL, s.jwtSecret)
+	accessToken, expirationTime, err = utils.GenerateAccessToken(
+		user.ID, user.Name, user.Email, refreshTokenId,
+		s.accessTokenTTL, s.jwtSecret, s.jwtIssuer, s.jwtAudience,
+	)
 	if err != nil {
 		log.Ctx(ctx).Error().
 			Err(err).
@@ -481,14 +513,7 @@ func (s *AuthService) generateTokens(ctx context.Context, user *store.User, user
 
 // generateRefreshToken creates and stores a new refresh token with device info
 func (s *AuthService) generateRefreshToken(ctx context.Context, user *store.User, userAgent, ipAddress, deviceID, deviceName string, oldTokenID uuid.NullUUID) (string, uuid.UUID, error) {
-	host, _, err := net.SplitHostPort(ipAddress)
-	if err != nil {
-		log.Ctx(ctx).Error().
-			Err(err).
-			Str("remote_addr", ipAddress).
-			Msg("Error parsing IP address from remote addr")
-		return "", uuid.Nil, err
-	}
+	host := utils.HostFromAddr(ipAddress)
 
 	rawToken, hashedToken, err := utils.GenerateRawAndHashedTokens()
 	if err != nil {
@@ -512,6 +537,16 @@ func (s *AuthService) generateRefreshToken(ctx context.Context, user *store.User
 
 	id, err := s.refreshTokenStore.Create(ctx, token)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			existing, activeErr := s.refreshTokenStore.GetActiveByUserAndDevice(ctx, user.ID, deviceID)
+			if activeErr == nil && existing != nil {
+				if revErr := s.revokeToken(ctx, existing.ID, store.RevokedReasonDeviceReLogin); revErr != nil {
+					return "", uuid.Nil, revErr
+				}
+				return s.generateRefreshToken(ctx, user, userAgent, ipAddress, deviceID, deviceName, oldTokenID)
+			}
+		}
 		return "", uuid.Nil, err
 	}
 
@@ -539,5 +574,20 @@ func (s *AuthService) ValidateInput(data any) error {
 
 // ValidateAccessToken verifies a JWT token and returns the claims
 func (s *AuthService) ValidateAccessToken(tokenString string) (jwt.MapClaims, error) {
-	return utils.ValidateAccessToken(tokenString, s.jwtSecret)
+	return utils.ValidateAccessToken(tokenString, s.jwtSecret, s.jwtIssuer, s.jwtAudience)
+}
+
+// EnsureAccessSessionActive checks that the refresh session referenced by sid is still active.
+func (s *AuthService) EnsureAccessSessionActive(ctx context.Context, userID, sessionID uuid.UUID) error {
+	leaf, err := s.refreshTokenStore.GetActiveForwardLeaf(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrSessionInactive
+		}
+		return err
+	}
+	if leaf.UserID != userID {
+		return ErrSessionInactive
+	}
+	return nil
 }

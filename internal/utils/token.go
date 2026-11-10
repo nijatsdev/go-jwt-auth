@@ -34,16 +34,26 @@ func HashToken(token string) string {
 }
 
 // GenerateAccessToken creates a new JWT access token
-func GenerateAccessToken(userID uuid.UUID, userName, userEmail string, refreshTokenID uuid.UUID, ttl time.Duration, jwtSecret []byte) (token string, expirationTime time.Time, err error) {
+func GenerateAccessToken(
+	userID uuid.UUID,
+	userName, userEmail string,
+	refreshTokenID uuid.UUID,
+	ttl time.Duration,
+	jwtSecret []byte,
+	issuer, audience string,
+) (token string, expirationTime time.Time, err error) {
 	expirationTime = time.Now().Add(ttl)
+	now := time.Now().Unix()
 
 	claims := jwt.MapClaims{
 		"sub":   userID.String(),
 		"name":  userName,
 		"email": userEmail,
 		"exp":   expirationTime.Unix(),
-		"iat":   time.Now().Unix(),
+		"iat":   now,
 		"sid":   refreshTokenID.String(),
+		"iss":   issuer,
+		"aud":   audience,
 	}
 	tokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	token, err = tokenObj.SignedString(jwtSecret)
@@ -54,13 +64,13 @@ func GenerateAccessToken(userID uuid.UUID, userName, userEmail string, refreshTo
 }
 
 // ValidateAccessToken verifies a JWT token and returns the claims
-func ValidateAccessToken(tokenString string, jwtSecret []byte) (jwt.MapClaims, error) {
+func ValidateAccessToken(tokenString string, jwtSecret []byte, issuer, audience string) (jwt.MapClaims, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (any, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+		if token.Method != jwt.SigningMethodHS256 {
 			return nil, ErrAccessTokenInvalid
 		}
 		return jwtSecret, nil
-	})
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
@@ -69,9 +79,38 @@ func ValidateAccessToken(tokenString string, jwtSecret []byte) (jwt.MapClaims, e
 		return nil, ErrAccessTokenInvalid
 	}
 
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		return claims, nil
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return nil, ErrAccessTokenInvalid
 	}
 
-	return nil, ErrAccessTokenInvalid
+	if issuer != "" {
+		iss, _ := claims["iss"].(string)
+		if iss != issuer {
+			return nil, ErrAccessTokenInvalid
+		}
+	}
+	if audience != "" {
+		switch aud := claims["aud"].(type) {
+		case string:
+			if aud != audience {
+				return nil, ErrAccessTokenInvalid
+			}
+		case []any:
+			match := false
+			for _, v := range aud {
+				if s, ok := v.(string); ok && s == audience {
+					match = true
+					break
+				}
+			}
+			if !match {
+				return nil, ErrAccessTokenInvalid
+			}
+		default:
+			return nil, ErrAccessTokenInvalid
+		}
+	}
+
+	return claims, nil
 }

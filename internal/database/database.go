@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nijatsdev/go-jwt-auth/internal/logger"
@@ -28,6 +30,7 @@ type Config struct {
 	Username string
 	Password string
 	Schema   string
+	SSLMode  string
 }
 
 // PoolConfig holds connection pool settings
@@ -43,6 +46,10 @@ type service struct {
 	poolConfig PoolConfig
 	logger     *logger.Logger
 	db         *sql.DB
+
+	healthMu        sync.Mutex
+	lastHealthStats sql.DBStats
+	lastHealthAt    time.Time
 }
 
 // New creates a new database service
@@ -54,17 +61,22 @@ func New(cfg Config, logger *logger.Logger) (Service, error) {
 		ConnMaxIdleTime: 5 * time.Minute,
 	}
 
-	connStr := fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/%s?sslmode=disable&search_path=%s",
-		cfg.Username,
-		cfg.Password,
-		cfg.Host,
-		cfg.Port,
-		cfg.Database,
-		cfg.Schema,
-	)
+	sslMode := cfg.SSLMode
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(cfg.Username, cfg.Password),
+		Host:   fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Path:   cfg.Database,
+	}
+	q := u.Query()
+	q.Set("sslmode", sslMode)
+	q.Set("search_path", cfg.Schema)
+	u.RawQuery = q.Encode()
 
-	db, err := sql.Open("pgx", connStr)
+	db, err := sql.Open("pgx", u.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -150,12 +162,19 @@ func (s *service) Health() map[string]string {
 		warnings = append(warnings, "Connection pool exhausted")
 	}
 
-	if dbStats.WaitDuration > 2*time.Second {
-		warnings = append(warnings, "High connection wait time")
-	}
+	s.healthMu.Lock()
+	waitDelta := dbStats.WaitDuration - s.lastHealthStats.WaitDuration
+	waitCountDelta := dbStats.WaitCount - s.lastHealthStats.WaitCount
+	interval := time.Since(s.lastHealthAt)
+	s.lastHealthStats = dbStats
+	s.lastHealthAt = time.Now()
+	s.healthMu.Unlock()
 
-	if dbStats.MaxLifetimeClosed > int64(s.poolConfig.MaxOpenConns) {
-		warnings = append(warnings, "Frequent connection recycling (max lifetime)")
+	if interval > 0 && waitCountDelta > 0 {
+		avgWait := waitDelta / time.Duration(waitCountDelta)
+		if avgWait > 200*time.Millisecond {
+			warnings = append(warnings, "High average connection wait time")
+		}
 	}
 
 	if len(warnings) > 0 {

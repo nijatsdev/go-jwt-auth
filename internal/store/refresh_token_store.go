@@ -64,7 +64,9 @@ type RefreshTokenStore interface {
 	CheckRotated(ctx context.Context, tokenID uuid.UUID) (bool, error)
 	ListByUserID(ctx context.Context, userID uuid.UUID, refreshTokenID string) ([]*RefreshTokenResponse, error)
 	RevokeRotationChain(ctx context.Context, tokenID uuid.UUID, reason RevokedReason) ([]uuid.UUID, error)
-	CleanupExpired(expiredRetentionDays, revokedRetentionDays int) (int64, error)
+	CleanupExpired(ctx context.Context, expiredRetentionDays, revokedRetentionDays int) (int64, error)
+	GetActiveChildByParent(ctx context.Context, parentID uuid.UUID) (*RefreshToken, error)
+	GetActiveForwardLeaf(ctx context.Context, tokenID uuid.UUID) (*RefreshToken, error)
 	Revoke(ctx context.Context, tokenID uuid.UUID, revokedReason RevokedReason) error
 	GetActiveByUserAndDevice(ctx context.Context, userID uuid.UUID, deviceID string) (*RefreshToken, error)
 	CountActiveSessionsByUser(ctx context.Context, userID uuid.UUID) (int, error)
@@ -301,13 +303,13 @@ func (s *PostgresRefreshTokenStore) RevokeRotationChain(ctx context.Context, tok
 }
 
 // CleanupExpired removes old expired and revoked tokens
-func (s *PostgresRefreshTokenStore) CleanupExpired(expiredRetentionDays, revokedRetentionDays int) (int64, error) {
+func (s *PostgresRefreshTokenStore) CleanupExpired(ctx context.Context, expiredRetentionDays, revokedRetentionDays int) (int64, error) {
 	query := `DELETE FROM oauth_refresh_tokens WHERE (
            -- Delete expired tokens older than retention period
            (revoked_at IS NULL AND expires_at < CURRENT_TIMESTAMP - ($1 || ' days')::INTERVAL) OR
            -- Delete revoked tokens older than retention period
            (revoked_at IS NOT NULL AND revoked_at < CURRENT_TIMESTAMP - ($2 || ' days')::INTERVAL) )`
-	result, err := s.db.Exec(query,
+	result, err := s.db.ExecContext(ctx, query,
 		strconv.Itoa(expiredRetentionDays),
 		strconv.Itoa(revokedRetentionDays),
 	)
@@ -484,4 +486,57 @@ func (s *PostgresRefreshTokenStore) CountChildrenByParent(ctx context.Context, p
 		return 0, err
 	}
 	return count, nil
+}
+
+// GetActiveChildByParent returns the newest active child token rotated from parentID.
+func (s *PostgresRefreshTokenStore) GetActiveChildByParent(ctx context.Context, parentID uuid.UUID) (*RefreshToken, error) {
+	db := s.getQueryable(ctx)
+	token := &RefreshToken{}
+	query := `SELECT id, user_id, user_agent, ip_address, device_id, device_name, token_hash, rotated_from, expires_at, created_at, revoked_at, revoked_reason
+		 FROM oauth_refresh_tokens
+		 WHERE rotated_from = $1
+		   AND revoked_at IS NULL
+		   AND expires_at > CURRENT_TIMESTAMP
+		 ORDER BY created_at DESC
+		 LIMIT 1`
+	err := db.QueryRowContext(ctx, query, parentID).Scan(
+		&token.ID,
+		&token.UserID,
+		&token.UserAgent,
+		&token.IPAddress,
+		&token.DeviceID,
+		&token.DeviceName,
+		&token.TokenHash,
+		&token.RotatedFrom,
+		&token.ExpiresAt,
+		&token.CreatedAt,
+		&token.RevokedAt,
+		&token.RevokedReason,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return token, nil
+}
+
+// GetActiveForwardLeaf walks the forward rotation chain and returns the newest active token.
+func (s *PostgresRefreshTokenStore) GetActiveForwardLeaf(ctx context.Context, tokenID uuid.UUID) (*RefreshToken, error) {
+	current, err := s.GetByID(ctx, tokenID)
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		child, childErr := s.GetActiveChildByParent(ctx, current.ID)
+		if errors.Is(childErr, sql.ErrNoRows) {
+			if !current.RevokedAt.Valid && time.Now().Before(current.ExpiresAt) {
+				return current, nil
+			}
+			return nil, sql.ErrNoRows
+		}
+		if childErr != nil {
+			return nil, childErr
+		}
+		current = child
+	}
 }

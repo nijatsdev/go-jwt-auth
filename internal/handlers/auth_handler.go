@@ -10,7 +10,6 @@ import (
 	"github.com/nijatsdev/go-jwt-auth/internal/services"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 )
 
 type AuthHandler struct {
@@ -60,6 +59,7 @@ func (h *AuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Cache-Control", "no-store")
 	response.WriteSuccess(w, r, http.StatusOK, "Login successful", response.Envelope{
 		"user":          result.User,
 		"access_token":  result.AccessToken,
@@ -71,8 +71,11 @@ func (h *AuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	claims := middleware.GetClaims(ctx)
-	refreshTokenID, _ := uuid.Parse(claims["sid"].(string))
+	refreshTokenID, ok := middleware.GetSessionID(ctx)
+	if !ok {
+		response.WriteUnauthorizedError(w, r, "Invalid access token")
+		return
+	}
 
 	err := h.authService.Logout(ctx, refreshTokenID)
 	if err != nil {
@@ -130,10 +133,15 @@ func (h *AuthHandler) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 			response.WriteUnauthorizedError(w, r, "Invalid or expired refresh token")
 			return
 		}
+		if errors.Is(err, services.ErrUserDeleted) {
+			response.WriteUnauthorizedError(w, r, "Invalid or expired refresh token")
+			return
+		}
 		response.WriteInternalServerError(w, r, "")
 		return
 	}
 
+	w.Header().Set("Cache-Control", "no-store")
 	response.WriteSuccess(w, r, http.StatusOK, "Token refresh successful", response.Envelope{
 		"access_token":  result.AccessToken,
 		"refresh_token": result.RefreshToken,
@@ -144,9 +152,22 @@ func (h *AuthHandler) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	userID := middleware.GetUserID(ctx)
+	userID, ok := middleware.GetUserID(ctx)
+	if !ok {
+		response.WriteUnauthorizedError(w, r, "Invalid access token")
+		return
+	}
 
-	refreshTokenID := middleware.GetClaims(ctx)["sid"].(string)
+	claims, ok := middleware.GetClaims(ctx)
+	if !ok {
+		response.WriteUnauthorizedError(w, r, "Invalid access token")
+		return
+	}
+	refreshTokenID, ok := claims["sid"].(string)
+	if !ok {
+		response.WriteUnauthorizedError(w, r, "Invalid access token")
+		return
+	}
 
 	sessions, err := h.authService.ListSessions(ctx, userID, refreshTokenID)
 	if err != nil {
@@ -162,7 +183,11 @@ func (h *AuthHandler) HandleListSessions(w http.ResponseWriter, r *http.Request)
 func (h *AuthHandler) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	userID := middleware.GetUserID(ctx)
+	userID, ok := middleware.GetUserID(ctx)
+	if !ok {
+		response.WriteUnauthorizedError(w, r, "Invalid access token")
+		return
+	}
 
 	sessionID := chi.URLParamFromCtx(ctx, "session_id")
 	if sessionID == "" {
@@ -174,10 +199,6 @@ func (h *AuthHandler) HandleRevokeSession(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		if errors.Is(err, services.ErrSessionNotFound) {
 			response.WriteNotFoundError(w, r, "Session not found")
-			return
-		}
-		if errors.Is(err, services.ErrUnauthorizedSession) {
-			response.WriteForbiddenError(w, r, "Unauthorized to revoke this session")
 			return
 		}
 		response.WriteInternalServerError(w, r, "")

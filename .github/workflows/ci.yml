@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Build
+        run: go build -o /dev/null ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -race -count=1 ./internal/middleware/... ./internal/utils/... ./internal/database/...
+
+      - name: Integration tests
+        run: go test -race -count=1 ./internal/handlers/...
+
+  docker-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build (amd64 migrate stage)
+        run: docker build --target migrate --platform linux/amd64 .
